@@ -1,88 +1,104 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/calpa/urusai/config"
 	"github.com/calpa/urusai/crawler"
 )
 
-func main() {
-	// Parse command line arguments
-	var configFile string
-	var logLevel string
-	var timeout int
+var (
+	// Overridden at build with: -ldflags "-X main.version=$(git describe --tags --dirty)"
+	version = "dev"
+)
 
-	flag.StringVar(&configFile, "config", "", "path to config file")
-	flag.StringVar(&logLevel, "log", "info", "logging level (debug, info, warn, error)")
-	flag.IntVar(&timeout, "timeout", 0, "for how long the crawler should be running, in seconds (0 means no timeout)")
+func main() {
+	// ───────────────────── flags ─────────────────────
+	cfgPath := flag.String("config", "", "path to JSON/YAML config file (optional)")
+	logLevel := flag.String("log", "info", "log level: debug|info|warn|error")
+	showVer := flag.Bool("version", false, "print version and exit")
+	timeout := flag.Duration("timeout", 0, "overall run timeout (e.g. 30s, 2m). 0 = no timeout")
 	flag.Parse()
 
-	// Set up logging
-	setLogLevel(logLevel)
+	if *showVer {
+		log.Printf("urusai %s", version)
+		return
+	}
 
-	// Load configuration
-	var cfg *config.Config
-	var err error
+	setLogLevel(*logLevel)
 
-	if configFile == "" {
-		// Use default configuration if no config file is specified
-		log.Println("No config file specified, using default configuration")
+	// ─────────────────── config load ─────────────────
+	var (
+		cfg *config.Config
+		err error
+	)
+
+	switch {
+	case *cfgPath == "":
+		log.Printf("INFO: %s using default config", time.Now().Format("2006/01/02 15:04:05"))
 		cfg, err = config.LoadDefaultConfig()
-		if err != nil {
-			log.Fatalf("Failed to load default config: %v", err)
-		}
-	} else {
-		// Load configuration from file
-		cfg, err = config.LoadFromFile(configFile)
-		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
-		}
+	default:
+		cfg, err = config.LoadFromFile(*cfgPath)
+	}
+	if err != nil {
+		log.Fatalf("ERROR: could not load config: %v", err)
 	}
 
-	// Set timeout if provided
-	if timeout > 0 {
-		cfg.Timeout = timeout
+	if *timeout > 0 {
+		cfg.Timeout = int(timeout.Seconds()) // keep legacy seconds field for crawler
 	}
 
-	// Create and start crawler
+	// ─────────────────── crawler init ────────────────
 	c := crawler.NewCrawler(cfg)
 
-	// Handle graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// ctx cancels on SIGINT/SIGTERM and optional timeout
+	baseCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	go func() {
-		<-sigChan
-		log.Println("Received shutdown signal, exiting gracefully...")
-		os.Exit(0)
-	}()
+	ctx := baseCtx
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(baseCtx, *timeout)
+		defer cancel()
+	}
 
-	// Start crawling
-	log.Println("Starting urusai - HTTP/DNS traffic noise generator")
-	c.Crawl()
+	log.Printf("INFO: %s starting urusai traffic generator ✈️", time.Now().Format("2006/01/02 15:04:05"))
+
+	c.Crawl(ctx)
 }
 
+// setLogLevel tweaks the global logger to the requested verbosity.
 func setLogLevel(level string) {
-	switch level {
+	const (
+		RESET  = "\033[0m"
+		BOLD   = "\033[1m"
+		RED    = "\033[31m"
+		GREEN  = "\033[32m"
+		YELLOW = "\033[33m"
+		BLUE   = "\033[34m"
+	)
+	switch strings.ToLower(level) {
 	case "debug":
 		log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-		log.SetPrefix("DEBUG: ")
+		log.SetPrefix(BLUE + "DEBUG: " + RESET)
 	case "info":
 		log.SetFlags(log.Ldate | log.Ltime)
-		log.SetPrefix("INFO: ")
-	case "warn":
+		log.SetPrefix(GREEN + "INFO: " + RESET)
+	case "warn", "warning":
 		log.SetFlags(log.Ldate | log.Ltime)
-		log.SetPrefix("WARNING: ")
+		log.SetPrefix(YELLOW + "WARNING: " + RESET)
 	case "error":
 		log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-		log.SetPrefix("ERROR: ")
+		log.SetPrefix(RED + "ERROR: " + RESET)
 	default:
 		log.SetFlags(log.Ldate | log.Ltime)
-		log.SetPrefix("INFO: ")
+		log.SetPrefix(GREEN + "INFO: " + RESET)
 	}
 }
